@@ -1,0 +1,27 @@
+name: mcp-pin
+version: "1.0.0"
+manifest_version: 2
+api_version: 1
+description: "Pins every MCP tool definition (description and parameter schema) the first time Hermes registers it. If a server later changes a tool (a rug pull, instructions hidden in a description, a new parameter) or adds a tool to a pinned server, MCP Pin hides the new definition from the model (tool list, tool_search catalog, tool_describe) and refuses calls to that tool until the owner reviews the change with /mcppin diff and approves it."
+author: "yuzuru99"
+license: MIT
+homepage: https://github.com/yuzuru99/hermes-mcp-pin
+requires_hermes: ">=0.23.0"
+tags: [security, mcp, supply-chain, tool-poisoning]
+provides_tools: []
+provides_hooks:
+  - pre_tool_call
+provides_middleware:
+  - llm_request
+  - tool_execution
+config_schema:
+  new_servers:
+    type: str
+    default: pin
+    label: "New MCP servers"
+    description: "'pin' trusts a server's tools the first time they are seen (and holds any later change). 'hold' holds them until you approve them with /mcppin approve <server>."
+  new_tools:
+    type: str
+    default: hold
+    label: "New tools on a pinned server"
+    description: "A tool that appears later on a server you already pinned. 'hold' (default) waits for your approval; 'pin' trusts it on first sight."
