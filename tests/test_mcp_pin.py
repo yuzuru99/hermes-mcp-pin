@@ -84,7 +84,8 @@ def test_poisoned_description_hidden_and_call_blocked(rt):
     assert out and "evil" not in d.description and d.description.startswith(HELD_NOTE) and "Read a file." in d.description
     assert d.parameters == {"type": "object", "properties": {}}
     block = rt.pre_tool_call("mcp__files__read_file", {"path": "a"})
-    assert block["action"] == "block" and "/mcppin approve" in block["message"]
+    assert block["action"] == "block" and "/mcppin diff mcp__files__read_file" in block["message"]
+    assert "code to approve" in block["message"]
     assert rt.pre_tool_call("mcp__files__list_dir", {}) is None
 
 

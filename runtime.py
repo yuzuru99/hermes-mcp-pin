@@ -303,8 +303,8 @@ class Runtime:
         if tool_name in held:
             return _block(
                 f"[mcp-pin] MCP tool '{tool_name}' was not run: its definition is new or changed since the "
-                f"owner approved this server, and it is held for review. The owner can inspect it with "
-                f"/mcppin diff {tool_name} and approve it with /mcppin approve {tool_name}. Do not retry.")
+                f"owner approved this server, and it is held for review. The owner can review it with "
+                f"/mcppin diff {tool_name}, which shows the code to approve it with. Do not retry.")
         return None
 
     # -- who may approve -----------------------------------------------------------------------
