@@ -151,7 +151,7 @@ class ReviewMismatch(Exception):
 def review_code(entries: dict[str, dict]) -> str:
     """Short code binding an approval to exactly the pending definitions that were shown."""
     blob = "\n".join(f"{n}:{e.get('hash')}" for n, e in sorted(entries.items()))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 class PinStore:
@@ -162,9 +162,14 @@ class PinStore:
     replaced. If the file vanishes after this process has seen it, that is treated as tampering (fail
     closed) rather than as a first run; ``reset()`` is the explicit way to start over."""
 
-    def __init__(self, path: Callable[[], Path], clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: Callable[[], Path], clock: Callable[[], float] = time.time,
+                 marker_get: Callable[[], Any] | None = None, marker_set: Callable[[Any], None] | None = None) -> None:
+        """*marker_get/marker_set* keep a copy of the store id outside the data directory (the plugin's
+        own settings), so a deleted pins.json is caught even by a process that never read it."""
         self._path_fn = path
         self._clock = clock
+        self._marker_get = marker_get
+        self._marker_set = marker_set
         self._lock = threading.RLock()
         self._key: tuple[int, int] | None = None
         self._data: dict[str, Any] = self._empty()
@@ -173,7 +178,8 @@ class PinStore:
 
     @staticmethod
     def _empty() -> dict[str, Any]:
-        return {"version": _STORE_VERSION, "tools": {}, "pending": {}, "forgotten": []}
+        return {"version": _STORE_VERSION, "store_id": os.urandom(8).hex(), "tools": {}, "pending": {},
+                "forgotten": []}
 
     # -- persistence ---------------------------------------------------------------------------
 
@@ -185,9 +191,9 @@ class PinStore:
         try:
             st = path.stat()
         except FileNotFoundError:
-            if self._seen_file:
+            if self._seen_file or self._marker():
                 self.error = (f"{path.name} disappeared; MCP tools are blocked so nothing is re-trusted silently. "
-                              f"Restore it, or start over with /mcppin reset from a local session")
+                              f"Restore it, or start over with /mcppin reset confirm from a local session")
                 raise StoreError(self.error) from None
             self._key, self.error, self._data = None, "", self._empty()
             return
@@ -200,42 +206,61 @@ class PinStore:
                 raise ValueError("not a pin file")
             data.setdefault("pending", {})
             data.setdefault("forgotten", [])
+            data.setdefault("store_id", os.urandom(8).hex())  # files written before 1.0.0 had none
             self._data, self._key, self.error, self._seen_file = data, key, "", True
         except Exception as exc:
             self.error = f"{path.name} is unreadable ({type(exc).__name__}); MCP tools are blocked until it is fixed"
             raise StoreError(self.error) from exc
+
+    def _marker(self) -> str:
+        if self._marker_get is None:
+            return ""
+        try:
+            return str(self._marker_get() or "")
+        except Exception:
+            return ""
+
+    @contextmanager
+    def _file_lock(self, path: Path):
+        """Exclusive lock file holding ``pid timestamp``. Waits at most 2 s; a lock whose pid is gone or
+        that is older than 30 s is taken over. Never blocks a turn for long: on timeout the caller gets a
+        StoreError (MCP withheld this time) instead."""
+        lock = path.with_name(path.name + ".lock")
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()} {time.time():.0f}".encode())
+                break
+            except FileExistsError:
+                if _lock_is_stale(lock):
+                    try:
+                        os.replace(lock, lock.with_name(f"{lock.name}.stale-{os.getpid()}"))
+                        os.unlink(lock.with_name(f"{lock.name}.stale-{os.getpid()}"))
+                    except OSError:
+                        pass  # another process took it over first, or Windows still has it open
+                    continue
+                if time.monotonic() > deadline:
+                    raise StoreError(f"{lock.name} is held by another process; MCP is withheld this time") from None
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
     @contextmanager
     def _writing(self):
         """Lock file + fresh read; yields the data to modify; saves on exit."""
         path = self._path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock = path.with_name(path.name + ".lock")
-        deadline = time.monotonic() + 10
-        fd = None
-        while fd is None:
-            try:
-                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                try:
-                    if time.time() - lock.stat().st_mtime > 30:  # a crashed writer's lock
-                        lock.unlink(missing_ok=True)
-                        continue
-                except FileNotFoundError:
-                    continue
-                if time.monotonic() > deadline:
-                    raise StoreError(f"{lock.name} is held by another process; try again") from None
-                time.sleep(0.02)
-        try:
+        with self._file_lock(path):
             self._load(force=True)
             yield self._data
             self._save(path)
-        finally:
-            os.close(fd)
-            try:
-                lock.unlink()
-            except OSError:
-                pass
 
     def _save(self, path: Path) -> None:
         fd, tmp = tempfile.mkstemp(prefix=".pins-", suffix=".tmp", dir=str(path.parent))
@@ -260,6 +285,12 @@ class PinStore:
             raise
         st = path.stat()
         self._key, self._seen_file, self.error = (st.st_mtime_ns, st.st_size), True, ""
+        store_id = self._data.get("store_id")
+        if self._marker_set is not None and store_id and self._marker() != store_id:
+            try:
+                self._marker_set(store_id)
+            except Exception:
+                pass
 
     # -- queries -------------------------------------------------------------------------------
 
@@ -371,12 +402,36 @@ class PinStore:
                 return names
 
     def reset(self) -> None:
-        """Start over: every tool is evaluated as on a first run (new servers per policy)."""
+        """Start over: every tool is evaluated as on a first run (new servers per policy). Works on a
+        corrupt or vanished file; the vanished-file guard is re-armed by the new file it writes."""
         with self._lock:
-            self._seen_file = False  # an explicit reset may follow a vanished file
-            with self._writing() as data:
-                data.clear()
-                data.update(self._empty())
+            path = self._path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._file_lock(path):
+                self._data = self._empty()
+                self._save(path)
+
+
+def _lock_is_stale(lock: Path) -> bool:
+    try:
+        raw = lock.read_text().split()
+        pid, ts = int(raw[0]), float(raw[1])
+    except (OSError, ValueError, IndexError):
+        try:
+            return time.time() - lock.stat().st_mtime > 30
+        except OSError:
+            return False
+    if time.time() - ts > 30:
+        return True
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
 
 
 def _matches(name: str, selector: str, server: str = "") -> bool:
@@ -394,13 +449,14 @@ def _escape(text: str) -> str:
     """Make invisible and control characters visible (bidi overrides, zero-width, tags, ANSI)."""
     out = []
     for ch in text:
-        if ch in "\n\t":
+        if ch in "\n\t ":
             out.append(ch)
-        elif unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs") or 0xE0000 <= ord(ch) <= 0xE007F:
+        elif (unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp", "Zs")
+              or 0xE0000 <= ord(ch) <= 0xE007F or ch in "\u2800\u3164\uffa0\u115f\u1160"):
             out.append(f"\\u{{{ord(ch):04x}}}")
         else:
             out.append(ch)
-    return "".join(out)
+    return "".join(out).replace("```", "\\u{60}\\u{60}\\u{60}")  # cannot close the reply's code block
 
 
 def render_review(pending: dict[str, dict], pins: dict[str, dict]) -> str:

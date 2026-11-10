@@ -41,7 +41,7 @@ def default_pins_path() -> Path:
     return plugin_data_dir(PLUGIN_NAME) / "pins.json"
 
 
-_FP_CACHE: dict[str, tuple[Any, str]] = {}
+_FP_CACHE: dict[str, tuple[Any, tuple, str]] = {}
 
 
 def registry_mcp_defs() -> list[McpDef]:
@@ -59,12 +59,13 @@ def registry_mcp_defs() -> list[McpDef]:
         schema = getattr(entry, "schema", None) or {}
         fn = schema.get("function") if isinstance(schema.get("function"), dict) else schema
         desc, params = str(fn.get("description") or ""), fn.get("parameters") or {}
+        ident = (id(schema), id(params), len(desc), len(params) if isinstance(params, dict) else 0)
         cached = _FP_CACHE.get(entry.name)
-        if cached is not None and cached[0] is schema:
-            h = cached[1]
+        if cached is not None and cached[0] is schema and cached[1] == ident:
+            h = cached[2]
         else:
             h = fingerprint(desc, params)
-            _FP_CACHE[entry.name] = (schema, h)
+            _FP_CACHE[entry.name] = (schema, ident, h)
         out.append(McpDef(str(entry.name), toolset[4:], desc, params, h))
     return out
 
@@ -143,6 +144,7 @@ class Runtime:
     def __init__(
         self,
         get_config: Callable[[str, Any], Any],
+        set_config: Callable[[str, Any], None] | None = None,
         *,
         pins_path: Callable[[], Path] = default_pins_path,
         mcp_defs: Callable[[], list[McpDef]] = registry_mcp_defs,
@@ -151,7 +153,10 @@ class Runtime:
         env: Callable[[str], str] = session_env,
     ) -> None:
         self._get = get_config
-        self.store = PinStore(pins_path)
+        self.store = PinStore(
+            pins_path,
+            marker_get=lambda: get_config("store_id", ""),
+            marker_set=(lambda v: set_config("store_id", v)) if set_config is not None else None)
         self._mcp_defs = mcp_defs
         self._toolset_of = toolset_of
         self._gateway_admins = gateway_admins

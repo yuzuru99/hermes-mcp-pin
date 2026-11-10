@@ -204,7 +204,7 @@ def test_agent_loop(tmp_path):
     review = cli("/mcppin diff files")
     assert "id_rsa" in review
     import re
-    code = re.search(r"/mcppin approve files ([0-9a-f]{8})", review).group(1)
+    code = re.search(r"/mcppin approve files ([0-9a-f]{16})", review).group(1)
     approved_reply = cli(f"/mcppin approve files {code}")
     assert "Approved and pinned" in approved_reply, approved_reply[-1500:]
     pins = json.loads((home / "plugin-data" / "mcp-pin" / "pins.json").read_text(encoding="utf-8"))

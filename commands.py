@@ -114,4 +114,4 @@ class Commands:
                 + (f" (next: /mcppin diff {selector} {page + 1})" if page < pages else ""))
         foot = (f"Read every page, then approve exactly this with: /mcppin approve {selector} {code}"
                 if page == pages else f"Approval code is on the last page ({pages}).")
-        return f"{head}\n{text}\n{foot}"
+        return f"{head}\n```\n{text}\n```\n{foot}"

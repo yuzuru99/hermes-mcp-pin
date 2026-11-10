@@ -17,7 +17,7 @@ def register(ctx: Any) -> None:
     from .commands import Commands
     from .runtime import Runtime
 
-    runtime = Runtime(ctx.get_config)
+    runtime = Runtime(ctx.get_config, ctx.set_config)
     commands = Commands(runtime)
     ctx.register_middleware("llm_request", runtime.llm_request)
     ctx.register_middleware("tool_execution", runtime.tool_execution)

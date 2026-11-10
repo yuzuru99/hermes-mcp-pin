@@ -25,3 +25,8 @@ config_schema:
     default: hold
     label: "New tools on a pinned server"
     description: "A tool that appears later on a server you already pinned. 'hold' (default) waits for your approval; 'pin' trusts it on first sight."
+  store_id:
+    type: str
+    default: ""
+    label: "Pin store id (set automatically)"
+    description: "Written by MCP Pin the first time it saves pins. If pins.json disappears while this is set, MCP tools stay blocked instead of being trusted again. Do not edit; /mcppin reset confirm starts over."

@@ -44,7 +44,7 @@ class Server:
 @pytest.fixture
 def rt(tmp_path):
     cfg, srv, holder = Cfg(), Server(), {"env": {}, "admins": {}}
-    r = Runtime(cfg.get, pins_path=lambda: tmp_path / "pins.json", mcp_defs=srv.defs,
+    r = Runtime(cfg.get, cfg.__setitem__, pins_path=lambda: tmp_path / "pins.json", mcp_defs=srv.defs,
                 toolset_of=lambda n: ("mcp-" + srv.tools[n][0]) if n in srv.tools else "",
                 gateway_admins=lambda: holder["admins"], env=lambda k: holder["env"].get(k, ""))
     r.cfg, r.srv, r.holder = cfg, srv, holder
@@ -416,3 +416,65 @@ def test_non_mcp_calls_skip_the_check(rt):
     calls = []
     rt._mcp_defs = lambda: calls.append(1) or []
     assert rt.pre_tool_call("terminal", {}) is None and not calls
+
+
+
+# ---------------------------------------------------------------- re-audit
+
+def test_review_code_is_64_bits(rt):
+    rt.sync()
+    rt.srv.set("mcp__files__read_file", desc=POISON)
+    rt.sync()
+    assert len(code_for(rt, "files")) == 16
+
+
+def test_deleted_pin_file_caught_by_a_fresh_process(rt, tmp_path):
+    rt.sync()
+    rt.srv.set("mcp__files__read_file", desc=POISON)
+    rt.sync()
+    assert rt.cfg.get("store_id")  # marker kept in the plugin's own settings
+    (tmp_path / "pins.json").unlink()
+    fresh = Runtime(rt.cfg.get, rt.cfg.__setitem__, pins_path=lambda: tmp_path / "pins.json",
+                    mcp_defs=rt.srv.defs, toolset_of=lambda n: "", gateway_admins=dict, env=lambda k: "")
+    assert "disappeared" in fresh.pre_tool_call("mcp__files__read_file", {})["message"]
+    assert not (tmp_path / "pins.json").exists()  # nothing re-pinned
+
+
+def test_reset_repairs_a_corrupt_file_and_rearms_the_guard(rt, tmp_path):
+    rt.sync()
+    (tmp_path / "pins.json").write_text("{corrupt")
+    assert rt.pre_tool_call("mcp__files__read_file", {})["action"] == "block"
+    assert "cleared" in Commands(rt).handle("reset confirm")
+    assert rt.pre_tool_call("mcp__files__read_file", {}) is None
+    (tmp_path / "pins.json").unlink()
+    assert rt.pre_tool_call("mcp__files__read_file", {})["action"] == "block"
+
+
+def test_orphan_lock_of_dead_process_is_taken_over(rt, tmp_path):
+    import time as _t
+    rt.sync()
+    (tmp_path / "pins.json.lock").write_text(f"999999 {_t.time():.0f}")  # pid that does not exist
+    rt.srv.set("mcp__files__read_file", desc=POISON)
+    start = _t.monotonic()
+    assert rt.pre_tool_call("mcp__files__read_file", {})["action"] == "block"
+    assert _t.monotonic() - start < 1.5 and "mcp__files__read_file" in rt.store.snapshot()["pending"]
+
+
+def test_live_lock_times_out_fast_and_withholds(rt, tmp_path):
+    import os as _os
+    import time as _t
+    rt.sync()
+    (tmp_path / "pins.json.lock").write_text(f"{_os.getppid()} {_t.time():.0f}")  # a live process
+    rt.srv.set("mcp__files__read_file", desc=POISON)
+    start = _t.monotonic()
+    block = rt.pre_tool_call("mcp__files__read_file", {})
+    assert block["action"] == "block" and _t.monotonic() - start < 3.5
+    (tmp_path / "pins.json.lock").unlink()
+
+
+def test_escape_covers_spaces_and_code_fences(rt):
+    rt.sync()
+    rt.srv.set("mcp__files__read_file", desc="a\u00a0b\u2028c\u3164d ```e")
+    out = Commands(rt).handle("diff mcp__files__read_file")
+    assert "\\u{00a0}" in out and "\\u{2028}" in out and "\\u{3164}" in out
+    assert out.count("```") == 2  # only the reply's own fence
