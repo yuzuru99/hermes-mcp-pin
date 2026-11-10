@@ -5,10 +5,11 @@ in Hermes's real tool registry (toolset ``mcp-files``), a request goes through t
 middleware chain and a call through ``model_tools.handle_function_call``, and the change is approved
 with the real ``/mcppin`` handler.
 
-``test_agent_loop`` (opt-in: ``MCP_PIN_E2E=1``, needs the ``mcp`` package): real ``hermes chat``
+``test_agent_loop`` (opt-in: ``MCP_PIN_E2E=1``, POSIX, needs the ``mcp`` package): real ``hermes chat``
 turns against a real stdio MCP server and a scripted OpenAI-compatible model, with Hermes's default
 tool_search on. The server's description is poisoned between turns; the test checks what the model
-was actually sent.
+was actually sent, then reviews and approves the change by typing ``/mcppin`` into the interactive CLI
+(which runs plugin commands through the local gateway, with a LOCAL source) and checks the approval.
 
 Run with Hermes's interpreter, e.g. ``~/.hermes/hermes-agent/.venv/bin/python -m pytest -q``.
 """
@@ -83,7 +84,8 @@ IN_PROCESS = textwrap.dedent(
     pin = get_plugin_command_handler("mcppin")
     out["status"] = pin("", platform="cli", source=None)
     out["diff"] = pin("diff " + NAME, platform="cli", source=None)
-    out["approve"] = pin("approve files", platform="cli", source=None)
+    code = out["diff"].rsplit(" ", 1)[-1]
+    out["approve"] = pin("approve files " + code, platform="cli", source=None)
     out["after"] = turn(sys.argv[1], extra_param=True)
     print("RESULT" + json.dumps(out))
     """
@@ -112,14 +114,16 @@ def test_in_process(tmp_path):
 
 
 def _stop_test_gateway(home: Path) -> None:
-    """Stop only the gateway this test's HERMES_HOME started (its pid file), never another Hermes."""
-    pid_file = home / "gateway.pid"
-    try:
-        raw = pid_file.read_text().strip()
-        pid = int(json.loads(raw)["pid"]) if raw.startswith("{") else int(raw)
-        os.kill(pid, 15)
-    except Exception:
-        pass
+    """Stop only the Hermes processes this test's HERMES_HOME started (found through /proc), never
+    another Hermes on the machine."""
+    want = f"HERMES_HOME={home}".encode()
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if want in (proc / "environ").read_bytes().split(b"\0") and b"hermes" in (proc / "cmdline").read_bytes():
+                os.kill(int(proc.name), 15)
+        except Exception:
+            pass
+    time.sleep(2)
 
 
 def _free_port() -> int:
@@ -140,6 +144,8 @@ def test_agent_loop(tmp_path):
             args: [{E2E / 'mcp_server.py'}]
             env:
               DESC_FILE: {desc}
+        telemetry:
+          shared_metrics: {{enabled: false, send: false, offer_version: 2}}
         model:
           provider: custom
           base_url: http://127.0.0.1:{port}/v1
@@ -185,3 +191,23 @@ def test_agent_loop(tmp_path):
     assert held["listing"] == ["- mcp__files__read_file: [held by mcp-pin]"]
     assert "id_rsa" not in held["results"][0] and "[mcp-pin]" in held["results"][0]
     assert "[mcp-pin]" in held["results"][1] and "contents of x" not in held["results"][1]
+
+    def cli(*commands: str) -> str:
+        try:
+            return subprocess.run([sys.executable, str(E2E / "cli_pty.py"), str(hermes), *commands], env=env,
+                                  cwd=str(tmp_path), capture_output=True, text=True, timeout=200).stdout
+        finally:
+            _stop_test_gateway(home)
+            subprocess.run(["pkill", "-f", str(E2E / "mcp_server.py")], check=False)
+            time.sleep(1)
+
+    review = cli("/mcppin diff files")
+    assert "id_rsa" in review
+    import re
+    code = re.search(r"/mcppin approve files ([0-9a-f]{8})", review).group(1)
+    approved_reply = cli(f"/mcppin approve files {code}")
+    assert "Approved and pinned" in approved_reply, approved_reply[-1500:]
+    pins = json.loads((home / "plugin-data" / "mcp-pin" / "pins.json").read_text(encoding="utf-8"))
+    assert pins["tools"]["mcp__files__read_file"]["approved_by"] == "local" and not pins["pending"]
+    # That the approved definition then runs is covered by test_in_process (the MCP server's lifecycle
+    # across separate CLI processes makes another turn here timing-dependent).
